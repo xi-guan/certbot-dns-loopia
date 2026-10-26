@@ -14,7 +14,7 @@ except FileNotFoundError:
 
 setup(
     name="certbot-dns-loopia",
-    version="1.0.1",
+    version="1.0.2",
     description="Loopia DNS authentication plugin for Certbot",
     long_description=LONG_DESC,
     long_description_content_type="text/markdown",
