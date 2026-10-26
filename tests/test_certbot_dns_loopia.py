@@ -8,7 +8,7 @@ import socket
 import threading
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from typing import Any, Dict, Iterable, Iterator, List, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 from xmlrpc.server import SimpleXMLRPCServer
 
@@ -18,7 +18,7 @@ import dns.rdatatype
 import dns.resolver
 import dns.rrset
 import pytest
-from acme import messages
+from acme import challenges, messages
 from certbot import achallenges
 from certbot.errors import PluginError
 from certbot.tests import acme_util
@@ -132,6 +132,10 @@ class FakeDns(threading.Thread):
         self.loopia = loopia
         self.clock = clock
         self.delay = 0.0
+        #: Extra delay for each further record on the same name
+        self.stagger = 0.0
+        #: Ignore TXT queries, like a firewall blocking port 53
+        self.drop_txt = False
         self.records: Dict[Tuple[str, str], List[str]] = {
             ("example.se.", "NS"): ["ns1.example.se."],
             ("ns1.example.se.", "A"): ["127.0.0.1"],
@@ -150,21 +154,30 @@ class FakeDns(threading.Thread):
                 data, peer = self.sock.recvfrom(4096)
             except socket.timeout:
                 continue
-            self.sock.sendto(self.answer(dns.message.from_wire(data)).to_wire(), peer)
+            response = self.answer(dns.message.from_wire(data))
+            if response is not None:
+                self.sock.sendto(response.to_wire(), peer)
         self.sock.close()
 
-    def answer(self, query: dns.message.Message) -> dns.message.Message:
+    def answer(self, query: dns.message.Message) -> Optional[dns.message.Message]:
         """
-        Response to a query, empty if the name or type is unknown.
+        Response to a query, empty if the name or type is unknown, None if dropped.
         """
         question = query.question[0]
         key = (question.name.to_text(), dns.rdatatype.to_text(question.rdtype))
         self.queries.append(key + (bool(query.flags & dns.flags.RD),))
+        if self.drop_txt and key[1] == "TXT":
+            return None
 
         values = list(self.records.get(key, []))
-        if key == ("_acme-challenge.example.se.", "TXT") and self.clock.now >= self.delay:
-            records = self.loopia.zones.get(("example.se", "_acme-challenge"), [])
-            values += [f'"{record["rdata"]}"' for record in records]
+        if key[1] == "TXT":
+            for (domain, subdomain), records in list(self.loopia.zones.items()):
+                if key[0] == f"{subdomain}.{domain}.":
+                    values += [
+                        f'"{record["rdata"]}"'
+                        for i, record in enumerate(records)
+                        if self.clock.now >= self.delay + i * self.stagger
+                    ]
 
         response = dns.message.make_response(query)
         if values:
@@ -334,17 +347,23 @@ def test_unreachable_api(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> N
     assert len(clock.sleeps) == LoopiaClient.attempts - 1
 
 
-def perform(auth: LoopiaAuthenticator) -> None:
+def perform(auth: LoopiaAuthenticator, *domains: str) -> List[achallenges.AnnotatedChallenge]:
     """
-    Runs certbot's perform for one challenge on example.se.
+    Runs certbot's perform for one challenge per domain, example.se by default.
     """
-    achall = achallenges.KeyAuthorizationAnnotatedChallenge(
-        challb=acme_util.DNS01,
-        identifier=messages.Identifier(typ=messages.IDENTIFIER_FQDN, value="example.se"),
-        account_key=ACCOUNT_KEY,
-    )
+    achalls: List[achallenges.AnnotatedChallenge] = [
+        achallenges.KeyAuthorizationAnnotatedChallenge(
+            challb=acme_util.chall_to_challb(
+                challenges.DNS01(token=bytes([i]) * 16), messages.STATUS_PENDING,
+            ),
+            identifier=messages.Identifier(typ=messages.IDENTIFIER_FQDN, value=domain),
+            account_key=ACCOUNT_KEY,
+        )
+        for i, domain in enumerate(domains or ("example.se",))
+    ]
     with patch("certbot.display.util.notify"):
-        assert len(auth.perform([achall])) == 1
+        assert len(auth.perform(achalls)) == len(achalls)
+    return achalls
 
 
 def test_visible_immediately(
@@ -392,6 +411,73 @@ def test_never_visible(
 
     assert clock.now == 60
     assert "still not visible on nameservers 127.0.0.1" in caplog.text
+
+
+def test_silent_nameserver(
+        monkeypatch: pytest.MonkeyPatch,
+        dns_server: FakeDns,
+        auth: LoopiaAuthenticator,
+        clock: FakeClock,
+        caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Keeps asking an IPv4 nameserver that never answers until propagation-seconds
+    """
+    monkeypatch.setattr(LoopiaAuthenticator, "dns_timeout", 0.1)
+    dns_server.drop_txt = True
+
+    perform(auth)
+
+    assert clock.now == 60
+    assert len([q for q in dns_server.queries if q[1] == "TXT"]) == 13
+    assert "still not visible on nameservers 127.0.0.1" in caplog.text
+
+
+def test_wildcard_and_base_domain(
+        dns_server: FakeDns,
+        loopia: FakeLoopia,
+        auth: LoopiaAuthenticator,
+        clock: FakeClock,
+) -> None:
+    """
+    example.se and *.example.se put two values on _acme-challenge.example.se,
+    which may show up at different times
+    """
+    dns_server.delay = 6
+    dns_server.stagger = 6
+
+    # the ACME server names the wildcard authorization example.se as well
+    achalls = perform(auth, "example.se", "example.se")
+
+    assert clock.sleeps == [5, 5, 5]
+    assert len(loopia.zones["example.se", "_acme-challenge"]) == 2
+
+    auth.cleanup(achalls)
+
+    assert not loopia.zones
+    assert loopia.calls.count("removeZoneRecord") == 2
+    assert loopia.calls.count("removeSubdomain") == 1
+
+
+def test_two_loopia_domains(
+        dns_server: FakeDns,
+        auth: LoopiaAuthenticator,
+        clock: FakeClock,
+) -> None:
+    """
+    Each domain is checked on its own nameservers
+    """
+    dns_server.records["other.se.", "NS"] = ["ns1.example.se."]
+
+    perform(auth, "example.se", "other.se")
+
+    assert clock.now == 0
+    queries = {q[:2] for q in dns_server.queries}
+    assert {("example.se.", "NS"), ("other.se.", "NS")} <= queries
+    assert {
+        ("_acme-challenge.example.se.", "TXT"),
+        ("_acme-challenge.other.se.", "TXT"),
+    } <= queries
 
 
 def test_unreachable_ipv6_is_ignored(
