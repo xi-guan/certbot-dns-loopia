@@ -26,7 +26,7 @@ setup(
     install_requires=[
         "acme>=1.8.0",
         "certbot>=1.10.0",
-        "dnspython>=2.0.0",
+        "dnspython>=2.6.1",
         "requests",
         "tldextract>=3.3.0",
     ],
