@@ -25,7 +25,7 @@ setup(
     py_modules=["certbot_dns_loopia"],
     install_requires=[
         "acme>=1.8.0",
-        "certbot>=1.7.0",
+        "certbot>=1.10.0",
         "dnspython>=2.0.0",
         "requests",
         "tldextract>=3.3.0",
