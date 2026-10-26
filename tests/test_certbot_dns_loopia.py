@@ -262,10 +262,15 @@ def test_perform_cleanup_cycle(loopia: FakeLoopia, auth: LoopiaAuthenticator) ->
     ]
 
 
-def test_cleanup_keeps_other_records(loopia: FakeLoopia, auth: LoopiaAuthenticator) -> None:
+def test_cleanup_keeps_other_records(
+        loopia: FakeLoopia,
+        auth: LoopiaAuthenticator,
+        caplog: pytest.LogCaptureFixture,
+) -> None:
     """
     Records the plugin did not create stay, and so does their subdomain
     """
+    caplog.set_level(logging.DEBUG)
     loopia.zones["example.se", "_acme-challenge"] = [
         {"type": "TXT", "ttl": 3600, "priority": 0, "rdata": "other", "record_id": 99},
     ]
@@ -274,6 +279,7 @@ def test_cleanup_keeps_other_records(loopia: FakeLoopia, auth: LoopiaAuthenticat
 
     assert [r["rdata"] for r in loopia.zones["example.se", "_acme-challenge"]] == ["other"]
     assert "removeSubdomain" not in loopia.calls
+    assert "'rdata': 'other'" in caplog.text
 
 
 @pytest.mark.parametrize("name, expected", [

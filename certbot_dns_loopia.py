@@ -236,7 +236,7 @@ class LoopiaAuthenticator(DNSAuthenticator):
                 # sub domain.
                 delete_subdomain = False
 
-                msg = "Record {} prevents the subdomain from being deleted"
+                msg = "Record %s prevents the subdomain from being deleted"
                 logger.debug(msg, record)
 
         # Delete subdomain if we emptied it completely
