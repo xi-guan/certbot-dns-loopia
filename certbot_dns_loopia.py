@@ -330,7 +330,7 @@ class LoopiaAuthenticator(DNSAuthenticator):
             query, address, timeout=self.dns_timeout, port=self.dns_port,
         )
         return [
-            b"".join(rdata.strings).decode()
+            b"".join(rdata.strings).decode(errors="replace")
             for rrset in response.answer
             if rrset.rdtype == dns.rdatatype.TXT
             for rdata in rrset

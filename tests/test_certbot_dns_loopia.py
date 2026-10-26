@@ -514,3 +514,18 @@ def test_nameserver_lookup_fails(
 
     assert clock.now == 60
     assert "Could not look up the nameservers" in caplog.text
+
+
+def test_other_txt_value_not_utf8(
+        dns_server: FakeDns,
+        auth: LoopiaAuthenticator,
+        clock: FakeClock,
+) -> None:
+    """
+    A foreign TXT value with arbitrary bytes on the name does not abort the wait
+    """
+    dns_server.records["_acme-challenge.example.se.", "TXT"] = ['"\\255"']
+
+    perform(auth)
+
+    assert clock.now == 0
