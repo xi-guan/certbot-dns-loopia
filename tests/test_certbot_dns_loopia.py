@@ -1,18 +1,29 @@
 """
 Tests for certbot-dns-loopia
 """
-# pylint: disable=protected-access,redefined-outer-name,invalid-name
+# pylint: disable=protected-access,redefined-outer-name,invalid-name,too-many-instance-attributes
 import itertools
+import logging
 import socket
 import threading
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any, Dict, Iterable, Iterator, List, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from xmlrpc.server import SimpleXMLRPCServer
 
+import dns.flags
+import dns.message
+import dns.rdatatype
+import dns.resolver
+import dns.rrset
 import pytest
+from acme import messages
+from certbot import achallenges
 from certbot.errors import PluginError
+from certbot.tests import acme_util
+from cryptography.hazmat.primitives.asymmetric import rsa
+from josepy.jwk import JWKRSA
 
 import certbot_dns_loopia
 from certbot_dns_loopia import LoopiaAuthenticator, LoopiaClient
@@ -20,6 +31,7 @@ from certbot_dns_loopia import LoopiaAuthenticator, LoopiaClient
 USER = "test@loopiaapi"
 # quoted in the INI file, otherwise configobj cuts the value at "#" (issue #42)
 PASSWORD = "pass#word"
+ACCOUNT_KEY = JWKRSA(key=rsa.generate_private_key(public_exponent=65537, key_size=2048))
 
 
 class FakeLoopia(ThreadingMixIn, SimpleXMLRPCServer):
@@ -86,14 +98,91 @@ class FakeLoopia(ThreadingMixIn, SimpleXMLRPCServer):
         return "OK"
 
 
+class FakeClock:
+    """
+    Time of the plugin, which moves only when the plugin sleeps.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: List[float] = []
+
+    def monotonic(self) -> float:
+        """
+        Replaces time.monotonic
+        """
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        """
+        Replaces time.sleep
+        """
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class FakeDns(threading.Thread):
+    """
+    DNS server on localhost for example.se, serving the TXT records of the fake
+    Loopia API once the clock reaches `delay`.
+    """
+
+    def __init__(self, loopia: FakeLoopia, clock: FakeClock) -> None:
+        super().__init__(daemon=True)
+        self.loopia = loopia
+        self.clock = clock
+        self.delay = 0.0
+        self.records: Dict[Tuple[str, str], List[str]] = {
+            ("example.se.", "NS"): ["ns1.example.se."],
+            ("ns1.example.se.", "A"): ["127.0.0.1"],
+        }
+        #: (name, type, recursion desired) of each query
+        self.queries: List[Tuple[str, str, bool]] = []
+        self.stopped = threading.Event()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.settimeout(0.1)
+        self.port: int = self.sock.getsockname()[1]
+
+    def run(self) -> None:
+        while not self.stopped.is_set():
+            try:
+                data, peer = self.sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            self.sock.sendto(self.answer(dns.message.from_wire(data)).to_wire(), peer)
+        self.sock.close()
+
+    def answer(self, query: dns.message.Message) -> dns.message.Message:
+        """
+        Response to a query, empty if the name or type is unknown.
+        """
+        question = query.question[0]
+        key = (question.name.to_text(), dns.rdatatype.to_text(question.rdtype))
+        self.queries.append(key + (bool(query.flags & dns.flags.RD),))
+
+        values = list(self.records.get(key, []))
+        if key == ("_acme-challenge.example.se.", "TXT") and self.clock.now >= self.delay:
+            records = self.loopia.zones.get(("example.se", "_acme-challenge"), [])
+            values += [f'"{record["rdata"]}"' for record in records]
+
+        response = dns.message.make_response(query)
+        if values:
+            response.answer.append(
+                dns.rrset.from_text_list(question.name, 30, "IN", key[1], values),
+            )
+        return response
+
+
 @pytest.fixture
-def sleeps(monkeypatch: pytest.MonkeyPatch) -> List[float]:
+def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
     """
-    Records sleeps of the plugin instead of sleeping.
+    Fake time for the plugin, so tests do not really sleep.
     """
-    calls: List[float] = []
-    monkeypatch.setattr(certbot_dns_loopia, "sleep", calls.append)
-    return calls
+    fake = FakeClock()
+    monkeypatch.setattr(certbot_dns_loopia, "monotonic", fake.monotonic)
+    monkeypatch.setattr(certbot_dns_loopia, "sleep", fake.sleep)
+    return fake
 
 
 @pytest.fixture
@@ -109,6 +198,28 @@ def loopia(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeLoopia]:
     server.unstall.set()
     server.shutdown()
     server.server_close()
+
+
+@pytest.fixture
+def dns_server(
+        monkeypatch: pytest.MonkeyPatch,
+        loopia: FakeLoopia,
+        clock: FakeClock,
+) -> Iterator[FakeDns]:
+    """
+    Fake DNS used both as resolver and as authoritative nameserver.
+    """
+    server = FakeDns(loopia, clock)
+    server.start()
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = ["127.0.0.1"]
+    resolver.port = server.port
+    monkeypatch.setattr(dns.resolver, "default_resolver", resolver)
+    monkeypatch.setattr(LoopiaAuthenticator, "dns_port", server.port)
+    monkeypatch.setattr(LoopiaAuthenticator, "dns_timeout", 0.5)
+    yield server
+    server.stopped.set()
+    server.join()
 
 
 @pytest.fixture
@@ -191,7 +302,7 @@ def test_error_status(loopia: FakeLoopia, method: str, args: Tuple[Any, ...]) ->
     assert loopia.calls == [method]
 
 
-def test_stalled_call_is_retried(loopia: FakeLoopia, sleeps: List[float]) -> None:
+def test_stalled_call_is_retried(loopia: FakeLoopia, clock: FakeClock) -> None:
     """
     A hanging API call times out and is tried again
     """
@@ -199,10 +310,10 @@ def test_stalled_call_is_retried(loopia: FakeLoopia, sleeps: List[float]) -> Non
 
     assert LoopiaClient(USER, PASSWORD).call("getZoneRecords", "example.se", "x") == []
     assert loopia.calls == ["getZoneRecords", "getZoneRecords"]
-    assert len(sleeps) == 1
+    assert len(clock.sleeps) == 1
 
 
-def test_unreachable_api(monkeypatch: pytest.MonkeyPatch, sleeps: List[float]) -> None:
+def test_unreachable_api(monkeypatch: pytest.MonkeyPatch, clock: FakeClock) -> None:
     """
     Gives up after a few attempts without leaking the password
     """
@@ -214,4 +325,100 @@ def test_unreachable_api(monkeypatch: pytest.MonkeyPatch, sleeps: List[float]) -
     with pytest.raises(PluginError) as error:
         LoopiaClient(USER, PASSWORD).call("getZoneRecords", "example.se", "x")
     assert PASSWORD not in str(error.value)
-    assert len(sleeps) == LoopiaClient.attempts - 1
+    assert len(clock.sleeps) == LoopiaClient.attempts - 1
+
+
+def perform(auth: LoopiaAuthenticator) -> None:
+    """
+    Runs certbot's perform for one challenge on example.se.
+    """
+    achall = achallenges.KeyAuthorizationAnnotatedChallenge(
+        challb=acme_util.DNS01,
+        identifier=messages.Identifier(typ=messages.IDENTIFIER_FQDN, value="example.se"),
+        account_key=ACCOUNT_KEY,
+    )
+    with patch("certbot.display.util.notify"):
+        assert len(auth.perform([achall])) == 1
+
+
+def test_visible_immediately(
+        dns_server: FakeDns,
+        auth: LoopiaAuthenticator,
+        clock: FakeClock,
+) -> None:
+    """
+    Continues without waiting when the nameserver already has the record
+    """
+    perform(auth)
+
+    assert clock.now == 0
+    txt_queries = [q for q in dns_server.queries if q[1] == "TXT"]
+    assert txt_queries == [("_acme-challenge.example.se.", "TXT", False)]
+
+
+def test_visible_after_a_while(
+        dns_server: FakeDns,
+        auth: LoopiaAuthenticator,
+        clock: FakeClock,
+) -> None:
+    """
+    Polls until the nameserver has the record
+    """
+    dns_server.delay = 12
+
+    perform(auth)
+
+    assert clock.sleeps == [5, 5, 5]
+
+
+def test_never_visible(
+        dns_server: FakeDns,
+        auth: LoopiaAuthenticator,
+        clock: FakeClock,
+        caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Gives up at propagation-seconds and lets the CA try anyway
+    """
+    dns_server.delay = float("inf")
+
+    perform(auth)
+
+    assert clock.now == 60
+    assert "still not visible on nameservers 127.0.0.1" in caplog.text
+
+
+def test_unreachable_ipv6_is_ignored(
+        dns_server: FakeDns,
+        auth: LoopiaAuthenticator,
+        clock: FakeClock,
+        caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An IPv6 nameserver address without a route does not block
+    """
+    caplog.set_level(logging.DEBUG)
+    # documentation prefix, never routable
+    dns_server.records["ns1.example.se.", "AAAA"] = ["2001:db8::1"]
+
+    perform(auth)
+
+    assert clock.now == 0
+    assert "Nameserver 2001:db8::1 did not answer" in caplog.text
+
+
+def test_nameserver_lookup_fails(
+        dns_server: FakeDns,
+        auth: LoopiaAuthenticator,
+        clock: FakeClock,
+        caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Falls back to waiting the full propagation-seconds
+    """
+    del dns_server.records["example.se.", "NS"]
+
+    perform(auth)
+
+    assert clock.now == 60
+    assert "Could not look up the nameservers" in caplog.text

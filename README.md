@@ -57,7 +57,7 @@ parameters may be used:
 | Parameter                                   | Required?                  | Default | Description      |
 |---------------------------------------------|----------------------------|---------|-------------------|
 |`--dns-loopia-credentials <path>`            | :heavy_check_mark:️         | -       | The path of the INI file containing your Loopia API user credentials |
-|`--dns-loopia-propagation-seconds <seconds>` |                            | 900     |  Determines how many seconds to wait before contacting the ACME server after adding the zone record to Loopia DNS
+|`--dns-loopia-propagation-seconds <seconds>` |                            | 900     |  The longest time to wait for the zone record to show up on Loopia's nameservers before contacting the ACME server
 
 ### Examples
 
@@ -92,13 +92,14 @@ $ sudo certbot certonly \
 ## Known issues
 
 - Due to caching on Loopia's side it can take up to 15 minutes before
-  changes propagate. Therefore, the plugin will wait 15 minutes before
-  contacting the ACME server.
+  changes propagate. Therefore, after adding the zone records the plugin
+  asks every authoritative nameserver of the domain directly every 5 seconds,
+  and contacts the ACME server as soon as all of them serve the records.
 
-  It has been known to work with as little as 90 seconds and sometimes
-  less. If you want to try something other than 15 minutes, use
-  `--dns-loopia-propagation-seconds 90` for 90 seconds
-  or however many seconds you want.
+  `--dns-loopia-propagation-seconds` (default 15 minutes) is the upper
+  bound: when it runs out the plugin contacts the ACME server anyway.
+  IPv6 nameserver addresses that cannot be reached are skipped. If outgoing
+  DNS (port 53) is blocked, the plugin waits the full time.
 
 Contributing
 ------------

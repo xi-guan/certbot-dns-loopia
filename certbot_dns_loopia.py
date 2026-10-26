@@ -1,14 +1,24 @@
 """
 Contains the Loopia DNS ACME authenticator class.
 """
+import ipaddress
 import logging
 import xmlrpc.client
-from time import sleep
-from typing import Any, Callable, Dict, Optional, Tuple
+from time import monotonic, sleep
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from xml.parsers.expat import ExpatError
 
+import dns.exception
+import dns.flags
+import dns.message
+import dns.query
+import dns.rdatatype
+import dns.resolver
 import requests
+from acme import challenges
 from tldextract import TLDExtract
+from certbot import achallenges
+from certbot.display import util as display_util
 from certbot.errors import PluginError
 from certbot.plugins.dns_common import DNSAuthenticator, CredentialsConfiguration
 from certbot.configuration import NamespaceConfig
@@ -86,6 +96,15 @@ class LoopiaAuthenticator(DNSAuthenticator):
     #: TTL for the validation TXT record
     ttl = 30
 
+    #: Seconds between checks of the authoritative nameservers
+    poll_interval = 5
+
+    #: Seconds to wait for a single DNS answer
+    dns_timeout = 5
+
+    #: Port the authoritative nameservers are queried on
+    dns_port = 53
+
     def __init__(self, config: NamespaceConfig, name: str) -> None:
         super().__init__(config, name)
         self._client = None
@@ -110,6 +129,37 @@ class LoopiaAuthenticator(DNSAuthenticator):
         """
 
         return "\n".join(line[4:] for line in __doc__.strip().split("\n"))
+
+    def perform(
+            self,
+            achalls: List[achallenges.AnnotatedChallenge],
+    ) -> List[challenges.ChallengeResponse]:
+        """
+        Same as DNSAuthenticator.perform, but polls the nameservers instead of
+        sleeping for propagation-seconds.
+        """
+        self._setup_credentials()
+
+        self._attempt_cleanup = True
+
+        responses = []
+        records = []
+        for achall in achalls:
+            # older certbot only has achall.domain
+            if hasattr(achall, "identifier"):
+                domain = achall.identifier.value
+            else:
+                domain = achall.domain
+            validation_name = achall.validation_domain_name(domain)
+            validation = achall.validation(achall.account_key)
+
+            self._perform(domain, validation_name, validation)
+            records.append((validation_name, validation))
+            responses.append(achall.response(achall.account_key))
+
+        self._wait_for_propagation(records)
+
+        return responses
 
     def _setup_credentials(self) -> None:
         self.credentials = self._configure_credentials(
@@ -194,3 +244,94 @@ class LoopiaAuthenticator(DNSAuthenticator):
             msg = "Removing subdomain %s on domain %s"
             logger.debug(msg, subdomain, loopia_domain)
             loopia.call("removeSubdomain", loopia_domain, subdomain)
+
+    def _wait_for_propagation(self, records: List[Tuple[str, str]]) -> None:
+        """
+        Wait until all authoritative nameservers serve the TXT records, but no
+        longer than propagation-seconds.
+        """
+        timeout = self.conf("propagation-seconds")
+        start = monotonic()
+        deadline = start + timeout
+        display_util.notify(
+            f"Waiting up to {timeout} seconds for DNS changes to propagate"
+        )
+
+        # (validation name, validation, nameserver address) not confirmed yet
+        pending: Set[Tuple[str, str, str]] = set()
+        try:
+            addresses: Dict[str, List[str]] = {}
+            for name, validation in records:
+                loopia_domain = self._split_domain(name)[0]
+                if loopia_domain not in addresses:
+                    addresses[loopia_domain] = self._nameserver_addresses(loopia_domain)
+                pending.update((name, validation, a) for a in addresses[loopia_domain])
+        except (dns.exception.DNSException, OSError) as exc:
+            logger.warning("Could not look up the nameservers: %s", exc)
+            pending.clear()
+
+        seen = set()
+        while pending:
+            for check in sorted(pending):
+                name, validation, address = check
+                try:
+                    if validation in self._query_txt(name, address):
+                        seen.add((name, validation))
+                        pending.discard(check)
+                except (dns.exception.DNSException, OSError) as exc:
+                    logger.debug("Nameserver %s did not answer: %s", address, exc)
+                    # containers often have no ipv6 route, so ipv6 must not block
+                    if ipaddress.ip_address(address).version == 6:
+                        pending.discard(check)
+
+            if not pending:
+                break
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "TXT records still not visible on nameservers %s after %d "
+                    "seconds, continuing anyway",
+                    ", ".join(sorted({address for _, _, address in pending})),
+                    timeout,
+                )
+                return
+            sleep(min(self.poll_interval, remaining))
+
+        if seen == set(records):
+            logger.info("TXT records visible on all nameservers after %d seconds",
+                        monotonic() - start)
+            return
+
+        logger.warning("Could not check the nameservers, waiting %d seconds", timeout)
+        sleep(max(0.0, deadline - monotonic()))
+
+    def _nameserver_addresses(self, domain: str) -> List[str]:
+        """
+        IP addresses of the authoritative nameservers of a domain.
+        """
+        addresses: List[str] = []
+        for nameserver in dns.resolver.resolve(domain, "NS"):
+            for rdtype in ("A", "AAAA"):
+                try:
+                    answer = dns.resolver.resolve(nameserver.target, rdtype)
+                except dns.resolver.NoAnswer:
+                    continue
+                addresses.extend(rdata.address for rdata in answer)
+        return addresses
+
+    def _query_txt(self, name: str, address: str) -> List[str]:
+        """
+        TXT values of a name, asked directly from one nameserver.
+        """
+        query = dns.message.make_query(name, dns.rdatatype.TXT)
+        # without recursion the nameserver must answer from its own zone data
+        query.flags &= ~dns.flags.RD
+        response, _ = dns.query.udp_with_fallback(
+            query, address, timeout=self.dns_timeout, port=self.dns_port,
+        )
+        return [
+            b"".join(rdata.strings).decode()
+            for rrset in response.answer
+            if rrset.rdtype == dns.rdatatype.TXT
+            for rdata in rrset
+        ]
