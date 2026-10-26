@@ -2,14 +2,75 @@
 Contains the Loopia DNS ACME authenticator class.
 """
 import logging
-from typing import Callable, Optional
+import xmlrpc.client
+from time import sleep
+from typing import Any, Callable, Dict, Optional, Tuple
+from xml.parsers.expat import ExpatError
 
+import requests
 from tldextract import TLDExtract
+from certbot.errors import PluginError
 from certbot.plugins.dns_common import DNSAuthenticator, CredentialsConfiguration
 from certbot.configuration import NamespaceConfig
-from loopialib import DnsRecord, Loopia
 
 logger = logging.getLogger(__name__)
+
+
+class LoopiaClient:  # pylint: disable=too-few-public-methods
+    """
+    Minimal client for the Loopia XML-RPC API, see https://www.loopia.com/api/
+    """
+
+    url = "https://api.loopia.se/RPCSERV"
+
+    #: Seconds before a stalled API call is given up
+    timeout = 30
+
+    #: Tries per API call on connection errors, timeouts and HTTP 5xx
+    attempts = 3
+
+    def __init__(self, user: str, password: str) -> None:
+        self._user = user
+        self._password = password
+
+    def call(self, method: str, *args: Any) -> Any:
+        """
+        Call an API method and return its result, raise PluginError on failure.
+        """
+        body = xmlrpc.client.dumps((self._user, self._password) + args, method)
+        attempt = 1
+        while True:
+            try:
+                response = requests.post(
+                    self.url,
+                    data=body.encode("utf-8"),
+                    headers={"Content-Type": "text/xml"},
+                    timeout=self.timeout,
+                )
+                if response.status_code < 500:
+                    break
+                error = f"HTTP {response.status_code}"
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                error = str(exc)
+
+            # a retried addZoneRecord may leave a duplicate, _cleanup removes all matches
+            if attempt >= self.attempts:
+                raise PluginError(f"Loopia API call {method} failed: {error}")
+            logger.warning("Loopia API call %s failed (%s), retrying", method, error)
+            sleep(2 * attempt)
+            attempt += 1
+
+        try:
+            response.raise_for_status()
+            result = xmlrpc.client.loads(response.content)[0][0]
+        except (requests.HTTPError, xmlrpc.client.Error, ExpatError) as exc:
+            raise PluginError(f"Loopia API call {method} failed: {exc}") from exc
+
+        # loopia reports errors as a status string, alone or in a one-item list
+        status = result[0] if isinstance(result, list) and len(result) == 1 else result
+        if isinstance(status, str) and status != "OK":
+            raise PluginError(f"Loopia API call {method} failed: {status}")
+        return result
 
 
 class LoopiaAuthenticator(DNSAuthenticator):
@@ -60,13 +121,23 @@ class LoopiaAuthenticator(DNSAuthenticator):
             },
         )
 
-    def _get_loopia_client(self) -> Loopia:
+    def _get_loopia_client(self) -> LoopiaClient:
         assert self.credentials, "Credentials not set"
+        user = self.credentials.conf("user")
+        password = self.credentials.conf("password")
+        assert user and password, "Credentials not set"
 
-        return Loopia(
-            self.credentials.conf("user"),
-            self.credentials.conf("password"),
-        )
+        return LoopiaClient(user, password)
+
+    def _split_domain(self, validation_name: str) -> Tuple[str, str]:
+        """
+        Split a name into the domain registered at Loopia and the subdomain.
+        """
+        parts = self._tld_extract(validation_name)
+        return f"{parts.domain}.{parts.suffix}", parts.subdomain or "@"
+
+    def _txt_record(self, validation: str) -> Dict[str, Any]:
+        return {"type": "TXT", "ttl": self.ttl, "priority": 0, "rdata": validation}
 
     def _perform(
         self,
@@ -75,17 +146,16 @@ class LoopiaAuthenticator(DNSAuthenticator):
         validation: str,
     ) -> None:
         loopia = self._get_loopia_client()
-        domain_parts = self._tld_extract(validation_name)
-
-        dns_record = DnsRecord("TXT", ttl=self.ttl, data=validation)
+        loopia_domain, subdomain = self._split_domain(validation_name)
 
         msg = "Creating TXT record for %s on subdomain %s"
-        logger.debug(msg, domain_parts.registered_domain, domain_parts.subdomain)
+        logger.debug(msg, loopia_domain, subdomain)
 
-        loopia.add_zone_record(
-            record=dns_record,
-            domain=domain_parts.registered_domain,
-            subdomain=domain_parts.subdomain or None,
+        loopia.call(
+            "addZoneRecord",
+            loopia_domain,
+            subdomain,
+            dict(self._txt_record(validation), record_id=0),
         )
 
     def _cleanup(
@@ -95,23 +165,21 @@ class LoopiaAuthenticator(DNSAuthenticator):
         validation: str,
     ) -> None:
         loopia = self._get_loopia_client()
-        domain_parts = self._tld_extract(validation_name)
-        dns_record = DnsRecord("TXT", ttl=self.ttl, data=validation)
+        loopia_domain, subdomain = self._split_domain(validation_name)
+        dns_record = self._txt_record(validation)
 
-        records = loopia.get_zone_records(
-            domain=domain_parts.registered_domain,
-            subdomain=domain_parts.subdomain or None,
-        )
+        records = loopia.call("getZoneRecords", loopia_domain, subdomain)
 
         delete_subdomain = True
         for record in records:
             # Make sure the record we delete actually matches the created
-            if dns_record.replace(id=record.id) == record:
+            if all(record.get(key) == value for key, value in dns_record.items()):
                 logger.debug("Removing zone record %s", record)
-                loopia.remove_zone_record(
-                    id=record.id,
-                    domain=domain_parts.registered_domain,
-                    subdomain=domain_parts.subdomain or None,
+                loopia.call(
+                    "removeZoneRecord",
+                    loopia_domain,
+                    subdomain,
+                    record["record_id"],
                 )
             else:
                 # This happens if there are other zone records on the current
@@ -123,9 +191,6 @@ class LoopiaAuthenticator(DNSAuthenticator):
 
         # Delete subdomain if we emptied it completely
         if delete_subdomain:
-            msg = "Removing subdomain %s on subdomain %s"
-            logger.debug(msg, domain_parts[1], domain_parts[0])
-            loopia.remove_subdomain(
-                domain=domain_parts.registered_domain,
-                subdomain=domain_parts.subdomain,
-            )
+            msg = "Removing subdomain %s on domain %s"
+            logger.debug(msg, subdomain, loopia_domain)
+            loopia.call("removeSubdomain", loopia_domain, subdomain)

@@ -26,7 +26,7 @@ setup(
     install_requires=[
         "acme>=1.8.0",
         "certbot>=1.7.0",
-        "loopialib>=0.2.0",
+        "requests",
         "tldextract>=3.3.0",
     ],
     extras_require={
@@ -35,6 +35,7 @@ setup(
             "wheel",
             "pylint==2.13.9",
             "mypy==0.961",
+            "types-requests",
         ],
     },
     entry_points={
